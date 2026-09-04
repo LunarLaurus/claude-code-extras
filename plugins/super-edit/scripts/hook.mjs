@@ -18,7 +18,7 @@
 // spend-only budget, exactly where it had gone silent. Ignore it repeatedly and
 // it still shuts up, which is the alarm-fatigue property worth keeping.
 
-import { readFileSync, writeFileSync, unlinkSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
 
 const DEFAULT_BUDGET = 5;
@@ -43,18 +43,24 @@ const SETTINGS_SCOPES = [
 ];
 
 // Anything under these never counts -- scratch work is a legitimate use of the
-// shell and is the majority of file-writing Bash calls in practice.
-const SCRATCH = /(^|[\s"'=])(\/tmp\/|\/dev\/|\/var\/tmp\/)|scratchpad|\.git\/|node_modules\//;
+// shell and is the majority of file-writing Bash calls in practice. `>` is in
+// the leading class because `cat >/tmp/x` has no whitespace to match on.
+const SCRATCH = /(^|[\s"'=>])(\/tmp\/|\/dev\/|\/var\/tmp\/)|scratchpad|\.git\/|node_modules\//;
 
+// Redirect rules carry a `target` capture group and a negative lookbehind for
+// `=`, `-` and `|`: `=>` and `->` inside a quoted argument (JS closures, jq,
+// C member access) are not redirects, and firing on those six times in one
+// session once spent the whole warning budget and taught the reader that the
+// nudge cries wolf.
 const WRITERS = [
   { re: /\bsed\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*i/, what: "sed -i" },
   { re: /\bperl\s+-[a-zA-Z]*i/, what: "perl -i" },
   { re: /\bpython3?\b[\s\S]*?\.write_text\s*\(/, what: "python write_text" },
   { re: /\bpython3?\b[\s\S]*?\bopen\s*\([^)]*['"][wa]\+?['"]/, what: "python open(...,'w')" },
   { re: /\bnode\b[\s\S]*?\b(writeFileSync|appendFileSync|createWriteStream)\b/, what: "node writeFileSync" },
-  { re: /\b(cat|tee|printf|echo)\b[^|<>]*>>?\s*[^\s>&|;]+/, what: "shell redirect" },
-  { re: />>?\s*[^\s>&|;]*\.[A-Za-z0-9]{1,6}\b/, what: "shell redirect" },
-  { re: /\|\s*tee\s+(-a\s+)?[^\s|;&]+/, what: "tee" },
+  { re: /\b(cat|tee|printf|echo)\b[^|<>]*(?<![=\-|])>>?\s*([^\s>&|;]+)/, what: "shell redirect", target: 2 },
+  { re: /(?<![=\-|])>>?\s*([^\s>&|;]*\.[A-Za-z0-9]{1,6}\b)/, what: "shell redirect", target: 1 },
+  { re: /\|\s*tee\s+(-a\s+)?([^\s|;&]+)/, what: "tee", target: 2 },
 ];
 
 // A heredoc fed straight to an interpreter is running a script, not editing a
@@ -101,7 +107,7 @@ function main() {
   const command = payload?.tool_input?.command;
   if (typeof command !== "string" || !command) return ok();
 
-  const hit = detect(command);
+  const hit = detect(command, { cwd: payload?.cwd, exists: existsSync });
   if (!hit) return ok();
 
   const counterPath = counterFile(payload);
@@ -121,7 +127,14 @@ function main() {
   );
 }
 
-export function detect(command) {
+// `opts.exists` decides whether a redirect target is already on disk, and
+// defaults to "yes" so the export stays pure for tests. A redirect into a
+// path that does not exist yet is creating a file, not editing one —
+// generated-file work the nudge's own text exempts, and the case it was
+// measurably over-firing on.
+export function detect(command, opts = {}) {
+  const exists = opts.exists ?? (() => true);
+  const cwd = opts.cwd ?? process.cwd();
   if (GIT_MESSAGE.test(command)) return null;
   // Strip heredoc-to-interpreter bodies before looking for writers, so a script
   // that merely mentions open(...,'w') on its own stdout is not flagged.
@@ -129,13 +142,26 @@ export function detect(command) {
     // Still flag it if the script clearly writes a named project file.
     if (!/\.write_text\s*\(|writeFileSync|\bopen\s*\([^)]*['"][wa]\+?['"]/.test(command)) return null;
   }
-  for (const { re, what } of WRITERS) {
-    if (!re.test(command)) continue;
+  for (const { re, what, target } of WRITERS) {
+    const m = re.exec(command);
+    if (!m) continue;
     if (SCRATCH.test(command)) return null;
     if (/>\s*\/dev\/null/.test(command) && !/>>?\s*[^\s>&|;]*\.[A-Za-z0-9]{1,6}/.test(command)) return null;
+    if (target !== undefined) {
+      const path = resolveTarget(m[target], cwd);
+      if (path !== null && !exists(path)) continue;
+    }
     return what;
   }
   return null;
+}
+
+function resolveTarget(raw, cwd) {
+  if (!raw) return null;
+  let path = raw.replace(/^['"]|['"]$/g, "");
+  if (path.startsWith("~/")) path = join(process.env.HOME || "", path.slice(2));
+  if (!path.startsWith("/")) path = join(cwd, path);
+  return path;
 }
 
 // Was this call gated behind a dialog, and if so what should the user be told?

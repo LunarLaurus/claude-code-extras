@@ -10,9 +10,15 @@
 // echoes changed regions back: this server's writes are invisible to the
 // harness's file snapshot, so on a file that was only ever Read, nothing else
 // will tell the caller what the file now looks like.
+//
+// The server is one long-lived process per session, which is what makes the
+// retry token free: a failed batch is cached server-side, so the next call
+// carries only the corrected patches. Field reports showed callers re-sending
+// the whole 8-patch batch to fix one typo every time; the token exists so
+// they don't have to.
 
 import { readFileSync, writeFileSync } from "node:fs";
-import { apply, changedRegions } from "./patch.mjs";
+import { apply, diffHunks } from "./patch.mjs";
 
 const PROTOCOL_VERSION = "2025-06-18";
 
@@ -20,24 +26,35 @@ const TOOL = {
   name: "super_edit",
   title: "Apply a batch of patches",
   description:
-    "Apply several edits in one call, across one or more files. Prefer this over shell edits " +
-    "(sed -i, python write_text, node writeFileSync) and over long runs of single Edit calls.\n\n" +
-    "Each patch matches either a literal string ('find') or a regular expression ('regex'), and " +
-    "states how many matches it expects. A count mismatch fails the patch instead of applying it: " +
-    "if you expected 10 occurrences and there are 8, your recollection of the file is wrong and you " +
-    "should re-read it rather than change 8 things.\n\n" +
-    "mode=atomic (default) writes nothing — to any file in the batch, not merely the file that " +
-    "failed — unless every patch succeeds. Patches are applied to in-memory buffers and only reach " +
-    "disk once all of them have, so there is no partial state to roll back. mode=independent applies " +
-    "the patches that succeed and reports each one that did not, which is what you want on a large " +
-    "batch where you need to know which entry was wrong.",
+    "Apply several edits in one call, across one or more files, with a predicted match count per patch and " +
+    "all-or-nothing writes. For a single simple substitution on one file, plain Edit is the better tool — reach " +
+    "for this when batching several patches, counting matches, or keeping multi-file edits atomic is the point. " +
+    "Prefer it over shell edits (sed -i, python write_text, node writeFileSync) and over long runs of single Edit calls.\n\n" +
+    "Each patch matches either a literal string ('find' — strip the Read tool's line-number-and-tab prefix before " +
+    "matching) or a regular expression ('regex'), and states how many matches it expects. A count mismatch fails " +
+    "the patch instead of applying it: if you expected 10 occurrences and there are 8, your recollection of the " +
+    "file is wrong and you should re-read it rather than change 8 things.\n\n" +
+    "Patches to the same file build on each other: each one matches the text as modified by the earlier ones. " +
+    "mode=atomic (default) writes nothing — to any file in the batch, not merely the file that failed — unless " +
+    "every patch succeeds. Patches are applied to in-memory buffers and only reach disk once all of them have, so " +
+    "there is no partial state to roll back. mode=independent applies the patches that succeed and reports each " +
+    "one that did not — for sweeps where absence is expected rather than alarming, e.g. the same rename across " +
+    "30 files, some of which legitimately do not contain it.\n\n" +
+    "When a batch fails, its report carries a retry token: the next call sends only the corrected patches, and " +
+    "the patches that validated re-run from the server's cache — an 8-patch batch with one typo costs one small " +
+    "second call, not a re-send of all 8 (nothing that already reached disk runs again). dry_run validates a " +
+    "batch without writing anything, and its token applies the batch as-is later: " +
+    '{"retry": "<token>", "patches": []}.\n\n' +
+    "Mixing this tool with Edit is safe. A later Read always shows the new content; on a file the harness has " +
+    "only ever seen you Read, the next Edit may ask for one re-Read first — that re-read is the whole cost.",
   inputSchema: {
     type: "object",
     properties: {
       patches: {
         type: "array",
-        minItems: 1,
-        description: "Applied in order. Patches to the same file build on each other.",
+        description:
+          "Applied in order. Patches to the same file build on each other. May be empty when 'retry' is given, " +
+          "to re-run a cached batch (e.g. applying a dry run) unchanged.",
         items: {
           type: "object",
           properties: {
@@ -65,13 +82,54 @@ const TOOL = {
         type: "integer",
         minimum: 0,
         maximum: 50,
-        description: "Lines of context around each changed region in the report. Default 3.",
+        description:
+          "Lines of context around each changed region in the report — the main cost lever for report size. " +
+          "Default 3; 0 for the tersest report.",
+      },
+      report: {
+        type: "string",
+        enum: ["auto", "diff", "summary", "none"],
+        description:
+          "How changed files are shown back. auto (default): changed regions with context, elided and reduced to a " +
+          "one-line-per-file summary when the diff would be large. diff: always the regions. summary: line ranges " +
+          "only. none: confirmation only. Failures are always reported in full whatever this says.",
+      },
+      dry_run: {
+        type: "boolean",
+        description: "Validate every patch and report as usual, but write nothing. The report's token applies the batch later.",
+      },
+      retry: {
+        type: "string",
+        description:
+          "Token from a failed batch's or a dry run's report. Re-runs the patches from that attempt that " +
+          "validated and have not reached disk, then applies this call's patches on top. Single use; mode " +
+          "defaults to that attempt's.",
       },
     },
-    required: ["patches"],
+    anyOf: [{ required: ["patches"] }, { required: ["retry"] }],
     additionalProperties: false,
   },
 };
+
+// --- retry-token cache ----------------------------------------------------
+// token -> { base: patches to re-run, mode, used }. Capped FIFO; tokens are
+// consumed on use so a batch can never be applied twice off one token.
+
+const attempts = new Map();
+const MAX_ATTEMPTS = 8;
+let attemptSeq = 0;
+
+function issueToken(base, mode) {
+  const token = `r${(attemptSeq += 1)}`;
+  attempts.set(token, { base, mode, used: false });
+  while (attempts.size > MAX_ATTEMPTS) attempts.delete(attempts.keys().next().value);
+  return token;
+}
+
+// The use-Edit note is correct but was shown on every single-patch call until
+// readers pattern-matched it as boilerplate — the field reports were plain
+// about that. Once per server lifetime (per session) is what it takes.
+let editNoteShown = false;
 
 let buffer = "";
 process.stdin.setEncoding("utf8");
@@ -104,7 +162,7 @@ function handle(line) {
           result: {
             protocolVersion: typeof params?.protocolVersion === "string" ? params.protocolVersion : PROTOCOL_VERSION,
             capabilities: { tools: {} },
-            serverInfo: { name: "super-edit", version: "0.1.0" },
+            serverInfo: { name: "super-edit", version: "0.2.0" },
           },
         });
       case "tools/list":
@@ -125,10 +183,31 @@ function handle(line) {
 }
 
 export function runEdit(args) {
-  const patches = Array.isArray(args.patches) ? args.patches : [];
-  if (!patches.length) return errorResult("No patches given.");
-  const mode = args.mode === "independent" ? "independent" : "atomic";
+  const patchesIn = Array.isArray(args.patches) ? args.patches : [];
+  const retryToken = typeof args.retry === "string" && args.retry ? args.retry : null;
+  if (!patchesIn.length && !retryToken) return errorResult("No patches given.");
+
+  let patches = patchesIn;
+  let mode = args.mode === "independent" || args.mode === "atomic" ? args.mode : undefined;
+  if (retryToken) {
+    const cached = attempts.get(retryToken);
+    if (!cached) {
+      return errorResult(`Unknown retry token ${JSON.stringify(retryToken)}.`);
+    }
+    if (cached.used) {
+      const live = [...attempts].filter(([, a]) => !a.used).map(([t]) => t);
+      return errorResult(
+        `Retry token ${retryToken} was already used — compose a fresh call${live.length ? ` (valid tokens: ${live.join(", ")})` : ""}.`,
+      );
+    }
+    cached.used = true;
+    patches = [...cached.base, ...patchesIn];
+    if (mode === undefined) mode = cached.mode;
+  }
+  if (mode === undefined) mode = "atomic";
+  const dryRun = args.dry_run === true;
   const context = Number.isInteger(args.context_lines) ? args.context_lines : 3;
+  const reportMode = ["auto", "diff", "summary", "none"].includes(args.report) ? args.report : "auto";
 
   // Read every distinct file once, up front. A file that cannot be read is
   // recorded as absent rather than thrown, so the report can name it alongside
@@ -158,26 +237,60 @@ export function runEdit(args) {
 
   const written = [];
   const writeFailures = [];
-  for (const [path, text] of writes) {
-    try {
-      writeFileSync(path, text, "utf8");
-      written.push(path);
-    } catch (err) {
-      writeFailures.push(`${path}: ${String(err?.message ?? err)}`);
+  if (!dryRun) {
+    for (const [path, text] of writes) {
+      try {
+        writeFileSync(path, text, "utf8");
+        written.push(path);
+      } catch (err) {
+        writeFailures.push(`${path}: ${String(err?.message ?? err)}`);
+      }
     }
   }
 
-  return { content: [{ type: "text", text: report({ mode, results, files, writes, written, writeFailures, readErrors, context, ok, editEquivalent }) }] };
-}
-
-function report({ mode, results, files, writes, written, writeFailures, readErrors, context, ok, editEquivalent }) {
-  const lines = [];
   const failures = results.filter((r) => !r.ok);
   const successes = results.filter((r) => r.ok);
 
+  // A token is worth issuing when there is something to re-run: the patches
+  // that validated but have not reached disk. In atomic mode a failure means
+  // nothing reached disk, so that is all the successes; in independent mode
+  // they already landed and re-running them would fail their own expect
+  // counts, so the cache is empty and only the corrections travel. A dry run
+  // never wrote, so its successes always cache — which is what makes
+  // {"retry": token, "patches": []} an apply-as-is.
+  const base = dryRun || mode === "atomic" ? successes.map((r) => patches[r.index]) : [];
+  const token = successes.length && (!ok || dryRun) ? issueToken(base, mode) : null;
+  const filesTouched = written.length || new Set(successes.map((r) => r.file)).size;
+
+  return {
+    content: [
+      {
+        type: "text",
+        text: report({ mode, results, files, writes, written, writeFailures, readErrors, context, ok, editEquivalent, dryRun, token, reportMode, filesTouched }),
+      },
+    ],
+  };
+}
+
+// Beyond this many rendered lines across the whole report, auto mode shows
+// per-file summaries instead. Field reports put the merged-span bloat at
+// ~25-30x the lines actually changed; per-patch hunks with elision bound the
+// common cases well below this, and the cap catches the rest.
+const MAX_REPORT_LINES = 60;
+
+function report({ mode, results, files, writes, written, writeFailures, readErrors, context, ok, editEquivalent, dryRun, token, reportMode, filesTouched }) {
+  const lines = [];
+  const failures = results.filter((r) => !r.ok);
+  const successes = results.filter((r) => r.ok);
+  const prefix = dryRun ? "DRY RUN — nothing was written. " : "";
+
   if (ok) {
-    lines.push(`Applied ${successes.length} patch${successes.length === 1 ? "" : "es"} across ${written.length} file${written.length === 1 ? "" : "s"}.`);
-    if (editEquivalent) {
+    lines.push(
+      `${prefix}${dryRun ? "Would apply" : "Applied"} ${successes.length} patch${successes.length === 1 ? "" : "es"} across ` +
+        `${filesTouched} file${filesTouched === 1 ? "" : "s"}.`,
+    );
+    if (editEquivalent && !editNoteShown) {
+      editNoteShown = true;
       lines.push(
         "",
         "Note: this was one literal substitution with the expected count — plain Edit does the same" +
@@ -188,11 +301,14 @@ function report({ mode, results, files, writes, written, writeFailures, readErro
     }
   } else if (mode === "atomic") {
     lines.push(
-      `ATOMIC BATCH ABORTED — nothing was written. ${failures.length} of ${results.length} patches failed` +
+      `${prefix}ATOMIC BATCH ABORTED — nothing ${dryRun ? "would be" : "was"} written. ${failures.length} of ${results.length} patches failed` +
         (successes.length ? `; the other ${successes.length} would have applied cleanly.` : "."),
     );
   } else {
-    lines.push(`Applied ${successes.length} of ${results.length} patches; ${failures.length} failed. Files written: ${written.length}.`);
+    lines.push(
+      `${prefix}${dryRun ? "Would apply" : "Applied"} ${successes.length} of ${results.length} patches; ${failures.length} failed. ` +
+        `Files ${dryRun ? "to be " : ""}written: ${written.length}.`,
+    );
   }
 
   if (failures.length) {
@@ -209,6 +325,8 @@ function report({ mode, results, files, writes, written, writeFailures, readErro
             ` earlier in the batch, and patches build on each other. Your view of the file was right:` +
             ` re-order or rewrite this patch. Do not re-read.`,
         );
+      } else if (f.sawModifiedBuffer) {
+        lines.push(`        (counted against the file as already modified by earlier patches in this batch)`);
       }
       if (readErrors.has(f.file)) lines.push(`        read error: ${readErrors.get(f.file)}`);
     }
@@ -228,12 +346,50 @@ function report({ mode, results, files, writes, written, writeFailures, readErro
     for (const w of writeFailures) lines.push(`  ${w}`);
   }
 
-  // The harness cannot see these writes, so show what the files now contain.
-  if (written.length) {
-    lines.push("", "Changed regions (this server's writes are not tracked by the harness, so this is your only view of them):");
-    for (const path of written) {
-      const region = changedRegions(files.get(path), writes.get(path), context);
-      lines.push("", `${path}  lines ${region.firstLine}-${region.lastLine}`, region.text);
+  if (token) {
+    lines.push("");
+    if (dryRun && ok) {
+      lines.push(`To apply for real: {"retry": "${token}", "patches": []}.`);
+    } else if (mode === "atomic") {
+      lines.push(
+        `Retry without re-sending the ${successes.length} that were fine: send {"retry": "${token}", "patches": [corrected]}` +
+          ` — they re-run from the server's cache, and a failed patch runs only if you re-send it here.`,
+      );
+    } else {
+      lines.push(
+        `Retry the failures without re-sending what landed: send {"retry": "${token}", "patches": [corrected]}` +
+          ` — nothing that already reached disk runs again.`,
+      );
+    }
+  }
+
+  // The harness shows its own copy of these writes only for files carrying a
+  // fresh Edit/Write snapshot; on files the caller has only ever Read, this
+  // report is the only view. Say which it is, and name the off-switch.
+  const targets = dryRun ? [...writes.keys()] : written;
+  if (targets.length && reportMode !== "none") {
+    const hunksByFile = new Map(targets.map((path) => [path, diffHunks(files.get(path), writes.get(path), context)]));
+    const totalRendered = [...hunksByFile.values()].reduce((n, hs) => n + hs.reduce((m, h) => m + h.rendered, 0), 0);
+    const summary = reportMode === "summary" || (reportMode === "auto" && totalRendered > MAX_REPORT_LINES);
+
+    lines.push(
+      "",
+      `Changed regions (the harness shows its own copy of these writes only for files with a fresh Edit/Write` +
+        ` snapshot; on files you have only Read, this is your only view${summary ? "" : ` — report: "summary" or "none" to skip it`}):`,
+    );
+    if (summary) {
+      if (reportMode === "auto") {
+        lines.push(`(diff would be ${totalRendered}+ lines — elided; report: "diff" to see it)`);
+      }
+      for (const [path, hunks] of hunksByFile) {
+        const total = writes.get(path).split("\n").length;
+        const ranges = hunks.map((h) => (h.firstLine === h.lastLine ? `${h.firstLine}` : `${h.firstLine}–${h.lastLine}`));
+        lines.push(`  ${path} — ${hunks.length} region${hunks.length === 1 ? "" : "s"}: ${ranges.join(", ")} (of ${total} lines)`);
+      }
+    } else {
+      for (const [path, hunks] of hunksByFile) {
+        for (const h of hunks) lines.push("", `${path}  lines ${h.firstLine}–${h.lastLine}`, h.text);
+      }
     }
   }
 

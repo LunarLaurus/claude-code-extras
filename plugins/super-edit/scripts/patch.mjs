@@ -117,26 +117,125 @@ function ensureGlobal(flags) {
   return clean.includes("g") ? clean : `${clean}g`;
 }
 
-// Line numbers of every line that differs, so the caller can echo the changed
-// regions back. The harness will not do it for us on a Read-only-tracked file.
-export function changedRegions(before, after, context = DEFAULT_CONTEXT) {
+// A hunk longer than this keeps only its first and last EDGE_LINES, with the
+// middle replaced by a marker: a large replacement is text the caller wrote
+// moments ago, and field reports measured echoing it back verbatim as the
+// single most expensive part of a successful call.
+export const MAX_HUNK_LINES = 24;
+const EDGE_LINES = 8;
+
+// Changed regions as separate hunks, so the caller can echo them back. The
+// harness will not do it for us on a Read-only-tracked file.
+//
+// This used to report one span from the first to the last differing line,
+// which is tight for a single edit — but patches spread across a file merged
+// into a span covering everything between them. Field reports measured ~25-30x
+// bloat that way, with the untouched middles skipped by every reader, so this
+// is now a real line diff. Distant changes produce separate hunks; changes
+// within 2*context of each other still merge, like a diff tool's hunks.
+export function diffHunks(before, after, context = DEFAULT_CONTEXT) {
   const a = before.split("\n");
   const b = after.split("\n");
-  // A full diff is overkill here: report the span from the first to the last
-  // line that differs, which for the edits this tool makes is tight enough.
-  let start = 0;
-  while (start < a.length && start < b.length && a[start] === b[start]) start += 1;
-  let endA = a.length - 1;
-  let endB = b.length - 1;
-  while (endA > start && endB > start && a[endA] === b[endB]) {
-    endA -= 1;
-    endB -= 1;
+
+  // Common prefix and suffix shrink the LCS table to the changed middle —
+  // usually a few lines — and bound the fallback when the middle is too big.
+  let pre = 0;
+  while (pre < a.length && pre < b.length && a[pre] === b[pre]) pre += 1;
+  let suf = 0;
+  while (suf < a.length - pre && suf < b.length - pre && a[a.length - 1 - suf] === b[b.length - 1 - suf]) suf += 1;
+  const midA = a.slice(pre, a.length - suf);
+  const midB = b.slice(pre, b.length - suf);
+
+  // Disturbed after-side offsets within the middle (0-based). null means the
+  // middle is too large to diff: fall back to one span over it, which is the
+  // old behaviour and still correct, just blunt.
+  let marks;
+  if (midA.length * midB.length > 4e6 || midB.length === 0) {
+    marks = new Set();
+    if (midB.length) for (let j = 0; j < midB.length; j += 1) marks.add(j);
+    else if (midA.length) marks.add(0); // deletion only; show around where it was
+  } else {
+    marks = lcsDisturbed(midA, midB);
   }
-  const from = Math.max(0, start - context);
-  const to = Math.min(b.length - 1, endB + context);
-  const lines = [];
-  for (let i = from; i <= to; i += 1) lines.push(`${i + 1}\t${b[i]}`);
-  return { firstLine: from + 1, lastLine: to + 1, text: lines.join("\n") };
+  if (!marks.size) return [];
+
+  // Expand each disturbed line by `context` and merge the overlaps.
+  const spans = [];
+  let start = null;
+  let end = null;
+  for (const j of [...marks].sort((x, y) => x - y)) {
+    const lo = j - context;
+    const hi = j + context;
+    if (start === null) {
+      start = lo;
+      end = hi;
+    } else if (lo <= end + 1) {
+      end = Math.max(end, hi);
+    } else {
+      spans.push([start, end]);
+      start = lo;
+      end = hi;
+    }
+  }
+  if (start !== null) spans.push([start, end]);
+
+  const hunks = [];
+  for (const [lo, hi] of spans) {
+    const to = Math.min(pre + hi, b.length - 1);
+    const from = Math.max(0, Math.min(pre + lo, to));
+    hunks.push(renderHunk(b, from, to));
+  }
+  return hunks;
+}
+
+// After-side offsets of every changed line: inserted/replaced lines directly,
+// and the surviving neighbours of a deletion, since that is where the removal
+// is visible. Walks one LCS of the two middles.
+function lcsDisturbed(a, b) {
+  const n = a.length;
+  const m = b.length;
+  // dp[i][j] = LCS length of a[i:] and b[j:]
+  const dp = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+    }
+  }
+  const disturbed = new Set();
+  const mark = (j) => {
+    if (j >= 0 && j < m) disturbed.add(j);
+  };
+  let i = 0;
+  let j = 0;
+  while (i < n && j < m) {
+    if (a[i] === b[j]) {
+      i += 1;
+      j += 1;
+    } else if (dp[i + 1][j] >= dp[i][j + 1]) {
+      mark(j); // a[i] was deleted in the gap just before b[j]
+      i += 1;
+    } else {
+      mark(j); // b[j] is new
+      j += 1;
+    }
+  }
+  for (; j < m; j += 1) mark(j); // trailing insertions
+  if (i < n) mark(m - 1); // trailing deletions land at the end of the middle
+  return disturbed;
+}
+
+function renderHunk(lines, from, to) {
+  const out = [];
+  const headEnd = Math.min(from + EDGE_LINES - 1, to);
+  for (let i = from; i <= headEnd; i += 1) out.push(`${i + 1}\t${lines[i]}`);
+  if (to - from + 1 > MAX_HUNK_LINES) {
+    const elided = to - from + 1 - 2 * EDGE_LINES;
+    out.push(`…\t${elided} lines elided (${from + EDGE_LINES + 1}–${from + EDGE_LINES + elided})`);
+    for (let i = to - EDGE_LINES + 1; i <= to; i += 1) out.push(`${i + 1}\t${lines[i]}`);
+  } else {
+    for (let i = headEnd + 1; i <= to; i += 1) out.push(`${i + 1}\t${lines[i]}`);
+  }
+  return { firstLine: from + 1, lastLine: to + 1, rendered: out.length, text: out.join("\n") };
 }
 
 /**
@@ -171,7 +270,19 @@ export function apply(patches, files, mode = "atomic") {
     const current = buffers.has(patch.file) ? buffers.get(patch.file) : files.get(patch.file);
     const outcome = applyOne(current, patch);
     if (outcome.error) {
-      const failure = { index: i, file: patch.file, ok: false, error: outcome.error, found: outcome.found, matches: outcome.matches };
+      const failure = {
+        index: i,
+        file: patch.file,
+        ok: false,
+        error: outcome.error,
+        found: outcome.found,
+        matches: outcome.matches,
+        // The count was taken against this file as earlier same-batch patches
+        // had already modified it, not against the disk file. The caller
+        // usually knows this, but at a count mismatch it is exactly the fact
+        // needed to interpret the number.
+        sawModifiedBuffer: buffers.has(patch.file) || undefined,
+      };
       // Distinguish "your model of the file is wrong" from "an earlier patch in
       // THIS batch moved the ground under you". They read identically at the
       // point of failure but demand opposite responses: re-read the file, versus

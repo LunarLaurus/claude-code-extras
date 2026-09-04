@@ -4,7 +4,7 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { apply, validate, changedRegions } from "../scripts/patch.mjs";
+import { apply, validate, diffHunks } from "../scripts/patch.mjs";
 import { detect } from "../scripts/hook.mjs";
 
 let pass = 0;
@@ -164,9 +164,38 @@ check("validate numbers patches one-based", /patch #1\b/.test(validate({ file: "
 {
   const before = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join("\n");
   const after = before.replace("line 15", "line 15 CHANGED");
-  const region = changedRegions(before, after, 2);
-  check("region is tight around the change", region.firstLine === 13 && region.lastLine === 17, `${region.firstLine}-${region.lastLine}`);
-  check("region shows the new content", /line 15 CHANGED/.test(region.text));
+  const hunks = diffHunks(before, after, 2);
+  check("single change is one tight hunk", hunks.length === 1 && hunks[0].firstLine === 13 && hunks[0].lastLine === 17, JSON.stringify(hunks));
+  check("hunk shows the new content", /line 15 CHANGED/.test(hunks[0].text));
+}
+{
+  // The case that motivated per-patch hunks: distant changes used to merge
+  // into one span covering everything between them (~25x bloat, field-measured).
+  const before = Array.from({ length: 120 }, (_, i) => `line ${i + 1}`).join("\n");
+  const after = before.replace("line 10\n", "line 10 CHANGED\n").replace("line 110\n", "line 110 CHANGED\n");
+  const hunks = diffHunks(before, after, 3);
+  check("distant changes stay separate hunks", hunks.length === 2, JSON.stringify(hunks.map((h) => [h.firstLine, h.lastLine])));
+  check("hunks do not span the untouched middle", hunks[1].firstLine - hunks[0].lastLine > 80, JSON.stringify(hunks.map((h) => [h.firstLine, h.lastLine])));
+}
+{
+  const before = Array.from({ length: 10 }, (_, i) => `l${i}`).join("\n");
+  const after = [...before.split("\n").slice(0, 5), "new1", "new2", ...before.split("\n").slice(5)].join("\n");
+  const hunks = diffHunks(before, after, 1);
+  check("a pure insertion is reported", hunks.length === 1 && /new1/.test(hunks[0].text), JSON.stringify(hunks));
+}
+{
+  const before = Array.from({ length: 10 }, (_, i) => `l${i}`).join("\n");
+  const after = before.replace("l5\n", "").replace("l6\n", "");
+  const hunks = diffHunks(before, after, 2);
+  check("a pure deletion is reported where it happened", hunks.length === 1 && hunks[0].firstLine === 4 && hunks[0].lastLine === 8, JSON.stringify(hunks));
+}
+{
+  // A large replacement is text the caller just wrote; it must be elided
+  // rather than echoed back in full.
+  const before = Array.from({ length: 130 }, (_, i) => `old ${i}`).join("\n");
+  const after = Array.from({ length: 130 }, (_, i) => (i >= 60 && i < 120 ? `new ${i}` : `old ${i}`)).join("\n");
+  const hunks = diffHunks(before, after, 3);
+  check("large replacement elides its middle", hunks.length === 1 && /lines elided/.test(hunks[0].text) && hunks[0].rendered <= 17, JSON.stringify(hunks[0]?.text));
 }
 
 // --- hook detection -----------------------------------------------------
@@ -184,53 +213,180 @@ const shouldNotFlag = [
   "git commit -q -F - <<'EOF'\nmessage\nEOF",
   "cargo build 2>&1 | tail -5",
   "ls -la > /dev/null",
+  // Arrow functions and -> inside quoted arguments are not redirects; these
+  // fired six times in one field session and exhausted the warning budget.
+  "just eval 'JSON.stringify(chart.series.values.map(s=>s.name))' oiot.ru",
+  "node -e \"x.filter(a=>a.id).map(b=>b.name)\"",
+  "just eval 'd.forEach(r=>{m[r.date]=r})' site.ru",
+  "jq '.items[] | select(.n>0)' f.json",
+  // A scratch heredoc under /tmp piped into a pod: `>` sits right before the
+  // path, which the scratch rule used to miss for lack of a preceding space.
+  "cat >/tmp/probe.py <<'PYEOF'\nprint(1)\nPYEOF\nkubectl exec -i deploy/x -- python3 - </tmp/probe.py",
 ];
 for (const cmd of shouldFlag) check(`flags: ${cmd.slice(0, 40)}`, detect(cmd) !== null);
 for (const cmd of shouldNotFlag) check(`ignores: ${cmd.slice(0, 40)}`, detect(cmd) === null, `got ${detect(cmd)}`);
 
-// --- end-to-end over the MCP protocol -----------------------------------
+// A redirect into a path that does not exist yet creates a file — generated
+// or bulk work the nudge's own text exempts. `exists` defaults to "yes" so
+// the checks above run without a filesystem.
 {
-  const dir = mkdtempSync(join(tmpdir(), "super-edit-"));
-  const target = join(dir, "sample.txt");
-  writeFileSync(target, "alpha\nbeta\ngamma\n");
-  const requests = [
-    { jsonrpc: "2.0", id: 1, method: "initialize", params: {} },
-    { jsonrpc: "2.0", id: 2, method: "tools/list" },
-    {
-      jsonrpc: "2.0",
-      id: 3,
-      method: "tools/call",
-      params: { name: "super_edit", arguments: { patches: [{ file: target, find: "beta", replace: "BETA" }] } },
-    },
-  ];
+  const heredoc = "cat > made-up.yml <<'EOF'\nx\nEOF";
+  check("new-file redirect is not flagged", detect(heredoc, { cwd: "/w", exists: (p) => p !== "/w/made-up.yml" }) === null);
+  check("existing-file redirect is still flagged", detect(heredoc, { cwd: "/w", exists: (p) => p === "/w/made-up.yml" }) !== null);
+  check("default assumes the target exists", detect(heredoc) !== null);
+  check("append to an existing file is flagged", detect("echo hi >> log/exists.txt", { cwd: "/w", exists: () => true }) !== null);
+}
+
+// --- end-to-end over the MCP protocol -----------------------------------
+// One drive() is one server process, so token state carries across calls in
+// the sequence — which is exactly what the retry tests need.
+function drive(requests) {
   const proc = spawnSync("node", [new URL("../scripts/mcp.mjs", import.meta.url).pathname], {
     input: requests.map((r) => JSON.stringify(r)).join("\n") + "\n",
     encoding: "utf8",
   });
-  const replies = proc.stdout.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
-  check("server answers all three", replies.length === 3, proc.stdout + proc.stderr);
-  check("server advertises super_edit", replies[1]?.result?.tools?.[0]?.name === "super_edit");
-  check("end-to-end write lands on disk", readFileSync(target, "utf8") === "alpha\nBETA\ngamma\n");
-  const appliedReport = replies[2]?.result?.content?.[0]?.text ?? "";
-  check("report echoes the changed region", /BETA/.test(appliedReport));
-  check("single literal call gets the use-Edit note", /plain Edit does the same/.test(appliedReport), appliedReport.slice(0, 120));
+  return proc.stdout.trim().split("\n").filter(Boolean).map((l) => JSON.parse(l));
+}
+const call = (id, args) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "super_edit", arguments: args } });
+const INIT = { jsonrpc: "2.0", id: 1, method: "initialize", params: {} };
 
-  // A count mismatch, end to end: the report must show where the matches were.
+{
+  const dir = mkdtempSync(join(tmpdir(), "super-edit-"));
+  const target = join(dir, "sample.txt");
+  writeFileSync(target, "alpha\nbeta\ngamma\n");
+  const replies = drive([
+    INIT,
+    { jsonrpc: "2.0", id: 2, method: "tools/list" },
+    call(3, { patches: [{ file: target, find: "beta", replace: "BETA" }] }),
+    call(4, { patches: [{ file: target, find: "gamma", replace: "GAMMA" }] }),
+  ]);
+  check("server answers all requests", replies.length === 4, JSON.stringify(replies.map((r) => r.id)));
+  check("server advertises super_edit", replies[1]?.result?.tools?.[0]?.name === "super_edit");
+  check("retry and report are in the schema", ["retry", "report", "dry_run"].every((k) => k in (replies[1]?.result?.tools?.[0]?.inputSchema?.properties ?? {})));
+  check("end-to-end write lands on disk", readFileSync(target, "utf8") === "alpha\nBETA\nGAMMA\n");
+  const first = replies[2]?.result?.content?.[0]?.text ?? "";
+  const second = replies[3]?.result?.content?.[0]?.text ?? "";
+  check("report echoes the changed region", /BETA/.test(first), first);
+  check("single literal call gets the use-Edit note", /plain Edit does the same/.test(first), first.slice(0, 160));
+  check("the use-Edit note fires once per session", !/plain Edit does the same/.test(second), second.slice(0, 160));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// A count mismatch, end to end: the report must show where the matches were.
+{
+  const dir = mkdtempSync(join(tmpdir(), "super-edit-"));
+  const target = join(dir, "sample.txt");
   writeFileSync(target, "alpha\nbeta\ngamma\nbeta\n");
-  const mismatch = spawnSync("node", [new URL("../scripts/mcp.mjs", import.meta.url).pathname], {
-    input:
-      JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) + "\n" +
-      JSON.stringify({
-        jsonrpc: "2.0", id: 2, method: "tools/call",
-        params: { name: "super_edit", arguments: { patches: [{ file: target, find: "beta", replace: "B" }] } },
-      }) + "\n",
-    encoding: "utf8",
-  });
-  const mismatchReport = JSON.parse(mismatch.stdout.trim().split("\n")[1]).result.content[0].text;
+  const mismatchReport = text(drive([
+    INIT,
+    call(2, { patches: [{ file: target, find: "beta", replace: "B" }] }),
+  ])[1]);
   check("mismatch report shows found count", /found 2 matches, expected 1/.test(mismatchReport), mismatchReport);
   check("mismatch report shows match locations", /found at: line 2: beta; line 4: beta/.test(mismatchReport), mismatchReport);
   check("mismatch report writes nothing", readFileSync(target, "utf8") === "alpha\nbeta\ngamma\nbeta\n");
   rmSync(dir, { recursive: true, force: true });
+}
+
+// Retry: a failed atomic batch hands back a token; the next call carries only
+// the corrected patch, and the good ones re-run from the server's cache.
+// Tokens are deterministic per process, so the first one a session issues is
+// r1 — the report itself is checked to confirm that.
+{
+  const dir = mkdtempSync(join(tmpdir(), "super-edit-"));
+  const target = join(dir, "sample.txt");
+  writeFileSync(target, "one\ntwo\nthree\n");
+  const replies = drive([
+    INIT,
+    call(2, { patches: [
+      { file: target, find: "one", replace: "ONE" },
+      { file: target, find: "two", replace: "TWO", expect: 2 },
+    ] }),
+    call(3, { retry: "r1", patches: [{ file: target, find: "two", replace: "TWO" }] }),
+    call(4, { retry: "r1", patches: [] }),
+    call(5, { retry: "r99", patches: [] }),
+  ]);
+  const failed = text(replies[1]);
+  const token = (failed.match(/"retry": "(r\d+)"/) ?? [])[1];
+  check("atomic failure offers retry token r1", token === "r1", failed);
+  check("retry hint names the cached patch count", /Retry without re-sending the 1 that were fine/.test(failed), failed);
+  check("retry applies the cached good patch too", /Applied 2 patches/.test(text(replies[2])), text(replies[2]));
+  check("retry landed the whole batch on disk", readFileSync(target, "utf8") === "ONE\nTWO\nthree\n", readFileSync(target, "utf8"));
+  check("consumed token errors", replies[3]?.result?.isError === true && /already used/.test(text(replies[3])), text(replies[3]));
+  check("unknown token errors", replies[4]?.result?.isError === true && /Unknown retry token/.test(text(replies[4])), text(replies[4]));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// Independent mode: what landed must not re-run, so the retry cache is empty
+// and only the corrections travel.
+{
+  const dir = mkdtempSync(join(tmpdir(), "super-edit-"));
+  const target = join(dir, "sample.txt");
+  writeFileSync(target, "one\ntwo\n");
+  const replies = drive([
+    INIT,
+    call(2, { mode: "independent", patches: [
+      { file: target, find: "one", replace: "ONE" },
+      { file: target, find: "missing", replace: "x" },
+    ] }),
+    call(3, { retry: "r1", patches: [{ file: target, find: "two", replace: "TWO" }] }),
+  ]);
+  const partial = text(replies[1]);
+  check("independent partial success offers a token", /"retry": "r1"/.test(partial) && /nothing that already reached disk runs again/.test(partial), partial);
+  check("independent applied the good patch", /Applied 1 of 2 patches/.test(partial), partial);
+  check("independent retry runs only the new patch", /Applied 1 patch/.test(text(replies[2])), text(replies[2]));
+  check("independent retry result on disk", readFileSync(target, "utf8") === "ONE\nTWO\n", readFileSync(target, "utf8"));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// Dry run: validates, writes nothing, and its token applies the batch as-is.
+// (If the dry run had written, the retry's own expect check would fail — so
+// the applied count is also the proof that it did not.)
+{
+  const dir = mkdtempSync(join(tmpdir(), "super-edit-"));
+  const target = join(dir, "sample.txt");
+  writeFileSync(target, "alpha\n");
+  const replies = drive([
+    INIT,
+    call(2, { dry_run: true, patches: [{ file: target, find: "alpha", replace: "ALPHA" }] }),
+    call(3, { retry: "r1", patches: [] }),
+  ]);
+  const dry = text(replies[1]);
+  check("dry run says nothing was written", /DRY RUN — nothing was written\./.test(dry) && /Would apply 1 patch/.test(dry), dry);
+  check("dry run offers apply-as-is", /To apply for real: \{"retry": "r1", "patches": \[\]\}/.test(dry), dry);
+  check("dry run's token applies the batch unchanged", readFileSync(target, "utf8") === "ALPHA\n", readFileSync(target, "utf8"));
+  check("apply-as-is reports the patch count", /Applied 1 patch/.test(text(replies[2])), text(replies[2]));
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// Report modes: none skips regions entirely; auto degrades to a per-file
+// summary when the diff would be large.
+{
+  const dir = mkdtempSync(join(tmpdir(), "super-edit-"));
+  const target = join(dir, "sample.txt");
+  const lines = Array.from({ length: 200 }, (_, i) => `line ${i + 1} payload text`);
+  const patches = [10, 25, 40, 55, 70, 85, 100, 115, 130, 145, 160, 175].map((n) => ({
+    file: target,
+    find: `line ${n} payload`,
+    replace: `line ${n} CHANGED`,
+  }));
+
+  writeFileSync(target, lines.join("\n") + "\n");
+  const none = drive([INIT, call(2, { patches, report: "none" })]);
+  check("report none skips regions", !/Changed regions/.test(text(none[1])), text(none[1]).slice(-200));
+
+  writeFileSync(target, lines.join("\n") + "\n");
+  const autoText = text(drive([INIT, call(2, { patches })])[1]);
+  check("auto degrades a large diff to summaries", /elided; report: "diff" to see it/.test(autoText) && /12 regions: /.test(autoText), autoText.slice(-400));
+  check("degraded summary keeps line ranges", /regions: 7–13, 22–28, 37–43/.test(autoText), autoText.slice(-400));
+
+  writeFileSync(target, lines.join("\n") + "\n");
+  const diffText = text(drive([INIT, call(2, { patches: [patches[0]], report: "diff" })])[1]);
+  check("diff mode shows region content", /line 10 CHANGED/.test(diffText), diffText);
+  rmSync(dir, { recursive: true, force: true });
+}
+
+function text(reply) {
+  return reply?.result?.content?.[0]?.text ?? "";
 }
 
 console.log(`${pass} passed, ${failures.length} failed`);

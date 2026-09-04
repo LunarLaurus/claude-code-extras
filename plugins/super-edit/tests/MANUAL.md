@@ -131,6 +131,13 @@ false positive worth fixing, because a nudge that cries wolf gets ignored.
 - **Agent:** `Bash(command="python3 - <<'EOF'\nprint(sum(range(10)))\nEOF")`
 - **Agent:** `Bash(command="sed -i 's/a/b/' /tmp/throwaway.txt")`
 - **Agent:** `Bash(command="cargo build 2>&1 | tail -5")`
+- **Agent:** `Bash(command="node -e \"x.filter(a=>a.id).map(b=>b.name)\"")` — arrow
+  functions in quoted arguments are not redirects; this fired six times in one
+  field session and spent the whole budget.
+- **Agent:** `Bash(command="cat >/tmp/probe.py <<'PYEOF'\nprint(1)\nPYEOF")` — no
+  space before `/tmp`, which the scratch rule used to miss.
+- **Agent:** `Bash(command="cat > brand-new-file.yml <<'EOF'\nx\nEOF")` in a
+  scratch directory — creating a file, not editing one.
 
 ## 7. Does the nudge actually change behaviour?
 
@@ -211,3 +218,37 @@ allow is not honoured for MCP tools at all, and check 9's stage-2 advice is
 wrong — try a server-level rule (the name with its `__super_edit` suffix
 removed) and record which form works. One live session reported still being
 prompted here after a restart, so treat this as **open, not settled.**
+
+## 11. The retry token survives a real round-trip
+
+Unit tests cover the semantics; this checks the part only a live session can —
+that a model actually composes the retry from the failure report rather than
+re-sending the batch, and that the second call really is small.
+
+- **Agent:** on a real multi-patch edit (or a probe file with 8 patches, one
+  deliberately miscounted), call `super_edit` and let it fail atomically.
+- **Agent:** fix the failed patch and apply the batch again, however you
+  naturally would.
+- **Human:** watch the second `tools/call` in the transcript.
+
+**Expected:** the second call uses `retry` with only the corrected patch(es).
+If the model re-sends all 8 anyway, the affordance failed where it matters —
+record what the failure report looked like, since the wording is the only
+lever.
+
+## 12. Report volume against the harness's own note
+
+The double report (tool regions + harness resync note) was the largest single
+token cost two sessions measured. The compact report should make the overlap
+cheap rather than eliminating it.
+
+- **Agent:** create a file of ~200 lines, `Edit` it once (fresh snapshot), then
+  `super_edit` a batch of 6–8 spread-out patches with default `report`.
+- **Agent:** quote the tool result's changed-regions section size, and whether
+  the harness's "file changed on disk" note still followed.
+
+**Expected:** the tool's section is either a handful of small hunks or the
+degraded one-line-per-file summary saying so; the harness note, if it appears,
+is now the larger of the two rather than a near-duplicate. If the model then
+sets `report: "summary"` unprompted on later calls, the description is doing
+its job.

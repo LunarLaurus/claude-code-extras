@@ -217,3 +217,74 @@ Sample caveat, from the reporter: one session, markdown and shell only, editing
 content it had authored minutes earlier. A session editing unfamiliar code would
 hit the overlap case harder, since patch ordering matters more when you cannot
 hold the file in your head.
+
+## The 2026-09 ergonomics pass
+
+Four field reports later (`feedback/`, 2026-08-17 through 2026-09-03, ~43
+patches, zero misapplications), the core operation was not the problem —
+everything around it was. What changed, and why:
+
+**The report is now a real diff, capped.** The old changed-regions report was
+one span from the first to the last differing line, tight for a single edit but
+catastrophic for spread-out ones: field measurements put multi-patch calls at
+~25–30× the lines actually changed, and on files with a fresh Edit/Write
+snapshot the harness printed its own copy right after (the double report two
+sessions flagged as the single biggest win available). `diffHunks` is a
+line-level LCS between before and after: distant changes produce separate
+hunks, hunks longer than 24 lines elide their middles, and if the whole report
+would still exceed 60 rendered lines, auto mode replaces it with one line per
+file naming the regions. Degrading is safe on the axes that matter: failures
+and counts always print in full regardless of report mode, and the summary
+keeps final line numbers, so the "only view of the write" property survives —
+what is lost is only re-reading text the caller wrote seconds earlier. Two
+sessions had `context_lines` in hand as the cost lever and never registered it
+as such; the new `report` parameter names the modes, and `context_lines` is
+documented as the lever it always was.
+
+**Failed batches hand back a retry token.** Every observed recovery from an
+atomic failure re-sent the entire batch — 8 patches to fix one typo. The
+server is one long-lived process per session, so a failed attempt caches its
+successful patches and issues a token; the next call sends only corrections
+and the cached patches re-run from memory. The chosen semantics are
+deliberately loose — "re-run what validated and hasn't reached disk, then
+apply this call's patches on top" — rather than index-addressed replacement:
+no mapping to learn, and a correction that targets an already-satisfied patch
+fails its own `expect` loudly instead of silently landing somewhere unintended.
+That looseness is why independent mode caches nothing (re-running what landed
+would fail its own counts), and why tokens are single-use (a batch can never
+apply twice off one token). `dry_run` fell out of the same cache: it validates
+without writing and its token applies the batch as-is, which covers "would
+these 8 patches apply cleanly?" with no rollback story at all.
+
+**The use-Edit note fires once per session.** It was correct every time and
+read none of the time: ~10 firings per session trained readers to skim past
+it. The trigger is unchanged; only the repetition went.
+
+**The hook's false positives were the reported ones, verified live before
+fixing.** Arrow functions in quoted arguments (`s=>s.name`) matched the
+bare-redirect rule — six wrong firings in one session, exhausting the budget
+so a real `sed -i` later went unwarned; redirects now require the `>` not to
+follow `=`, `-` or `|`. `cat >/tmp/x` escaped the scratch rule because the
+path's preceding character is `>`, not whitespace; `>` joined the class.
+And a redirect into a path that does not exist yet is creating a file — the
+generated/bulk work the nudge's own text exempts — so those are skipped via an
+existence probe (injected into `detect` so it stays pure for tests). The
+budget, the visible countdown and the write-0 opt-out are unchanged: two of
+three reports explicitly endorsed them, and NOTES above records why the
+refill-on-heeded design exists.
+
+**The description now states the interaction rules instead of letting callers
+invent them.** Two sessions independently invented "never mix super_edit and
+Edit on one file" from the old "writes are not tracked" sentence, and worked
+around a hazard that (per the resync measurements above) does not exist on
+fresh-snapshot files. The description says what is actually true — a later
+Read shows new content; on a Read-only file the next Edit may ask for one
+re-Read, and that is the whole cost. It also leads with when *not* to use the
+tool (one simple substitution → Edit), which reconciles the two nudges that
+were pushing in opposite directions, and commits the "strip the Read line
+prefix" sentence — sessions quoted it as load-bearing, but it had only ever
+lived in the working tree the user-scope registration ran, never in a commit.
+
+One thing deliberately not done: registering writes with the harness's
+snapshot. Nothing in the MCP protocol exposes it, and the resync mechanism
+already covers the fresh-snapshot case on its own.
