@@ -4,7 +4,7 @@ Hooks, plugins and other bonus features I use for my Claude Code setups,
 packaged as a plugin marketplace so they can be installed from any project.
 
 ```
-/plugin marketplace add gmatiukhin/claude-code-extras
+/plugin marketplace add danya02/claude-code-extras
 ```
 
 ## Plugins
