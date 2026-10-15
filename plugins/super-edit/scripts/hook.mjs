@@ -61,6 +61,7 @@ const SCRATCH = /(^|[\s"'=>])(\/tmp\/|\/dev\/|\/var\/tmp\/)|scratchpad|\.git\/|n
 // nudge cries wolf.
 const WRITERS = [
   { re: /\bsed\s+(-[a-zA-Z]*\s+)*-[a-zA-Z]*i/, what: "sed -i" },
+  { re: /\bsed\b[^|;&\n]*\s--in-place\b/, what: "sed -i" },
   { re: /\bperl\s+-[a-zA-Z]*i/, what: "perl -i" },
   { re: /\bpython3?\b[\s\S]*?\.write_text\s*\(/, what: "python write_text" },
   { re: /\bpython3?\b[\s\S]*?\bopen\s*\([^)]*['"][wa]\+?['"]/, what: "python open(...,'w')" },
