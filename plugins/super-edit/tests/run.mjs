@@ -235,6 +235,10 @@ for (const cmd of shouldNotFlag) check(`ignores: ${cmd.slice(0, 40)}`, detect(cm
   check("new-file redirect is not flagged", detect(heredoc, { cwd: "/w", exists: (p) => p.replaceAll("\\", "/") !== "/w/made-up.yml" }) === null);
   check("existing-file redirect is still flagged", detect(heredoc, { cwd: "/w", exists: (p) => p.replaceAll("\\", "/") === "/w/made-up.yml" }) !== null);
   check("default assumes the target exists", detect(heredoc) !== null);
+  // An absolute target in the platform's own form (C:\... on Windows) must not be joined onto the cwd.
+  const absTarget = join(tmpdir(), "..", "abs-target.yml");
+  const absHeredoc = `cat > "${absTarget}" <<'EOF'\nx\nEOF`;
+  check("absolute target resolves as itself", detect(absHeredoc, { cwd: "/w", exists: (p) => p === absTarget }) !== null);
   check("append to an existing file is flagged", detect("echo hi >> log/exists.txt", { cwd: "/w", exists: () => true }) !== null);
 }
 

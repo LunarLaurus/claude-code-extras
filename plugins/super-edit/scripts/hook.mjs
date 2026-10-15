@@ -19,8 +19,14 @@
 // it still shuts up, which is the alarm-fatigue property worth keeping.
 
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { homedir } from "node:os";
+import { join, dirname, isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
+
+// HOME is unset in a native Windows shell; os.homedir() falls back to USERPROFILE there.
+function homeDir() {
+  return process.env.HOME || homedir();
+}
 
 const DEFAULT_BUDGET = 5;
 
@@ -160,8 +166,8 @@ export function detect(command, opts = {}) {
 function resolveTarget(raw, cwd) {
   if (!raw) return null;
   let path = raw.replace(/^['"]|['"]$/g, "");
-  if (path.startsWith("~/")) path = join(process.env.HOME || "", path.slice(2));
-  if (!path.startsWith("/")) path = join(cwd, path);
+  if (path.startsWith("~/")) path = join(homeDir(), path.slice(2));
+  if (!isAbsolute(path)) path = join(cwd, path);
   return path;
 }
 
@@ -220,7 +226,7 @@ function findAllowEntry(cwd, tool) {
   const server = tool.replace(/__[^_]+$/, "");
   for (const [rel, label] of SETTINGS_SCOPES) {
     const path = rel.startsWith("~/")
-      ? join(process.env.HOME || "", rel.slice(2))
+      ? join(homeDir(), rel.slice(2))
       : join(cwd || process.cwd(), rel);
     try {
       const allow = JSON.parse(readFileSync(path, "utf8"))?.permissions?.allow;
@@ -269,7 +275,7 @@ function readStamp(path) {
 function counterFile(payload) {
   const base =
     process.env.CLAUDE_PLUGIN_DATA_DIR ||
-    join(process.env.HOME || "/tmp", ".claude", "super-edit");
+    join(homeDir(), ".claude", "super-edit");
   const session = String(payload?.session_id ?? "session").replace(/[^\w-]/g, "");
   return join(base, `warnings-${session}`);
 }
