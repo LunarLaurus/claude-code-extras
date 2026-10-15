@@ -2,6 +2,7 @@
 // node plugins/super-edit/tests/run.mjs
 import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { apply, validate, diffHunks } from "../scripts/patch.mjs";
@@ -231,8 +232,8 @@ for (const cmd of shouldNotFlag) check(`ignores: ${cmd.slice(0, 40)}`, detect(cm
 // the checks above run without a filesystem.
 {
   const heredoc = "cat > made-up.yml <<'EOF'\nx\nEOF";
-  check("new-file redirect is not flagged", detect(heredoc, { cwd: "/w", exists: (p) => p !== "/w/made-up.yml" }) === null);
-  check("existing-file redirect is still flagged", detect(heredoc, { cwd: "/w", exists: (p) => p === "/w/made-up.yml" }) !== null);
+  check("new-file redirect is not flagged", detect(heredoc, { cwd: "/w", exists: (p) => p.replaceAll("\\", "/") !== "/w/made-up.yml" }) === null);
+  check("existing-file redirect is still flagged", detect(heredoc, { cwd: "/w", exists: (p) => p.replaceAll("\\", "/") === "/w/made-up.yml" }) !== null);
   check("default assumes the target exists", detect(heredoc) !== null);
   check("append to an existing file is flagged", detect("echo hi >> log/exists.txt", { cwd: "/w", exists: () => true }) !== null);
 }
@@ -241,7 +242,7 @@ for (const cmd of shouldNotFlag) check(`ignores: ${cmd.slice(0, 40)}`, detect(cm
 // One drive() is one server process, so token state carries across calls in
 // the sequence — which is exactly what the retry tests need.
 function drive(requests) {
-  const proc = spawnSync("node", [new URL("../scripts/mcp.mjs", import.meta.url).pathname], {
+  const proc = spawnSync("node", [fileURLToPath(new URL("../scripts/mcp.mjs", import.meta.url))], {
     input: requests.map((r) => JSON.stringify(r)).join("\n") + "\n",
     encoding: "utf8",
   });

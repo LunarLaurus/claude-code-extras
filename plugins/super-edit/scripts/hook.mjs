@@ -20,6 +20,7 @@
 
 import { readFileSync, writeFileSync, unlinkSync, mkdirSync, existsSync } from "node:fs";
 import { join, dirname } from "node:path";
+import { pathToFileURL } from "node:url";
 
 const DEFAULT_BUDGET = 5;
 
@@ -301,4 +302,4 @@ function ok(additionalContext) {
   process.exit(0);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) main();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) main();
