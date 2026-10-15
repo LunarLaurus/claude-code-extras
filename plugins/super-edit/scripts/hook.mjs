@@ -123,7 +123,15 @@ function main() {
   if (remaining <= 0) return ok();
   writeBudget(counterPath, remaining - 1);
 
+  // Local addition: the Bash tool strips one level of backslash escaping before the shell parses the command,
+  // silently, so a shell edit whose content holds backslashes (\n, \\, Windows paths, regex) can corrupt a file.
+  const backslashNote = command.includes("\\")
+    ? `This command contains backslashes, and the Bash tool silently strips one level of them, so the edit may ` +
+      `not write what you typed. Use Edit or Write (verbatim), or the PowerShell tool.\n`
+    : "";
+
   ok(
+    backslashNote +
     `This Bash call edits a file in place (${hit}). Prefer Edit for a single change, or the ` +
       `super_edit tool for a batch across one or more files -- it applies all patches in one ` +
       `call and fails loudly when a match count is not what you predicted.\n` +
