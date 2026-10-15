@@ -492,6 +492,25 @@ const INIT = { jsonrpc: "2.0", id: 1, method: "initialize", params: {} };
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- changed-region report edge cases ------------------------------------
+{
+  const before = "l1\nl2\nl3\nl4\nl5\n";
+  const after = "l1\nL2\nl3\nl4\nL5\n";
+  const spans = (hunks) => JSON.stringify(hunks.map((h) => [h.firstLine, h.lastLine]));
+  check("a trailing newline does not add a phantom last line", spans(diffHunks(before, after, 3)) === "[[1,5]]", spans(diffHunks(before, after, 3)));
+  check("context 0 shows exactly the changed lines", spans(diffHunks(before, after, 0)) === "[[2,2],[5,5]]");
+  check("a negative context behaves as zero", spans(diffHunks(before, after, -1)) === spans(diffHunks(before, after, 0)));
+  check("a very negative context never runs backwards", diffHunks(before, after, -5).every((h) => h.lastLine >= h.firstLine));
+  check("a non-integer context falls back to the default", spans(diffHunks(before, after, 1.5)) === spans(diffHunks(before, after, 3)));
+  check("appending a line at the end is reported", spans(diffHunks("a\nb\n", "a\nb\nc\n", 3)) === "[[1,3]]");
+  check("removing the last line is reported", diffHunks("a\nb\nc\n", "a\nb\n", 0).length === 1);
+  check("adding only the final newline is still a change", diffHunks("a", "a\n", 3).length === 1);
+  check("removing only the final newline is still a change", diffHunks("a\n", "a", 3).length === 1);
+  check("identical text has no hunks", diffHunks(before, before, 3).length === 0);
+  check("a file without a trailing newline reports its real last line", spans(diffHunks("a\nb", "a\nB", 3)) === "[[1,2]]");
+  check("an empty before-text diffs against new content", diffHunks("", "x\n", 3).length === 1);
+}
+
 // --- more hook heuristics ------------------------------------------------
 {
   const flagged = (c) => detect(c, { cwd: "/w", exists: () => true }) !== null;
