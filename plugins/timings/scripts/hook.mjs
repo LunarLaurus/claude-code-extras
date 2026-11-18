@@ -3,93 +3,189 @@
 // runs one process per event, so the dispatch below is cheaper than eight
 // scripts sharing code through a module -- there is nothing to import.
 //
+// The event handling lives in `handleEvent`, which takes the event and the
+// environment as arguments and returns what to print. Two callers use it:
+//   - this file run as a script (`node hook.mjs`), one process per event, and
+//   - scripts/hookd.mjs, a resident daemon that serves many events in-process
+//     so the per-event node start-up is not paid on every tool call.
+//
 // Two rules hold everywhere in this file:
 //   1. Never block. Any failure exits 0 with no output; a timing plugin that
 //      can break the session is worse than no timing plugin.
 //   2. Never do a read-modify-write on state that concurrent hooks also touch.
 //      Parallel tool calls mean PreToolUse/PostToolUse can overlap, so those
-//      events use one file per tool_use_id plus an append-only log.
+//      events use one file per tool_use_id plus an append-only log. (Under the
+//      daemon the calls are also serialised, because handleEvent is synchronous.)
 
-import { appendFileSync, mkdirSync, readFileSync, renameSync, rmSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { spawn } from "node:child_process";
+import { appendFileSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const STATE_VERSION = 1;
 const STALE_SESSION_MS = 7 * 24 * 60 * 60 * 1000; // session dirs swept at SessionStart
 const STALE_STAMP_MS = 6 * 60 * 60 * 1000; // tool stamps whose PostToolUse never came
+const DAEMON_HEARTBEAT_STALE_SECONDS = 40; // keep in step with hookd.mjs and hook-client.sh
+const DAEMON_SPAWN_LOCK_MS = 15 * 1000;
 
-const dataDir = process.env.CLAUDE_PLUGIN_DATA || join(tmpdir(), "claude-code-timings");
-const sessionsDir = join(dataDir, "sessions");
+// Per-call context. handleEvent is synchronous from start to finish, so these are
+// assigned at the top of each call and never observed by a second call.
+let dataDir;
+let sessionsDir;
+let config;
+let output;
+let uptimeMs;
 
-const config = {
-  toolThresholdMs: num("TOOL_THRESHOLD_SECONDS", 10) * 1000,
-  idleThresholdMs: num("IDLE_THRESHOLD_SECONDS", 10) * 1000,
-  turnThresholdMs: num("TURN_THRESHOLD_SECONDS", 20) * 1000,
-  // Past this, a tool call is worth pinning to the wall clock: "took 4m" is
-  // hard to line up with anything, "12:30:00->12:34:00" is not.
-  clockPairMs: num("CLOCK_PAIR_SECONDS", 60) * 1000,
-  // Past this, an interrupt would lose real output, so the call should have
-  // been writing to a log.
-  scratchpadHintMs: num("SCRATCHPAD_HINT_SECONDS", 45) * 1000,
-  sessionGapMs: num("SESSION_GAP_SECONDS", 600) * 1000,
-  showClock: bool("SHOW_CLOCK", true),
-  visibleIdle: bool("VISIBLE_IDLE", true),
-  showHookOverhead: bool("SHOW_HOOK_OVERHEAD", false),
-  eventLog: bool("EVENT_LOG", true),
-  debugLog: bool("DEBUG_LOG", false),
-};
-
-function num(key, fallback) {
-  const raw = process.env[`CLAUDE_PLUGIN_OPTION_${key}`];
-  const parsed = Number(raw);
-  return raw === undefined || raw === "" || !Number.isFinite(parsed) || parsed < 0 ? fallback : parsed;
+function readConfig(env) {
+  const num = (key, fallback) => {
+    const raw = env[`CLAUDE_PLUGIN_OPTION_${key}`];
+    const parsed = Number(raw);
+    return raw === undefined || raw === "" || !Number.isFinite(parsed) || parsed < 0 ? fallback : parsed;
+  };
+  const bool = (key, fallback) => {
+    const raw = env[`CLAUDE_PLUGIN_OPTION_${key}`];
+    if (raw === undefined || raw === "") return fallback;
+    return !["false", "0", "no", "off"].includes(raw.trim().toLowerCase());
+  };
+  return {
+    toolThresholdMs: num("TOOL_THRESHOLD_SECONDS", 10) * 1000,
+    idleThresholdMs: num("IDLE_THRESHOLD_SECONDS", 10) * 1000,
+    turnThresholdMs: num("TURN_THRESHOLD_SECONDS", 20) * 1000,
+    // Past this, a tool call is worth pinning to the wall clock: "took 4m" is
+    // hard to line up with anything, "12:30:00->12:34:00" is not.
+    clockPairMs: num("CLOCK_PAIR_SECONDS", 60) * 1000,
+    // Past this, an interrupt would lose real output, so the call should have
+    // been writing to a log.
+    scratchpadHintMs: num("SCRATCHPAD_HINT_SECONDS", 45) * 1000,
+    sessionGapMs: num("SESSION_GAP_SECONDS", 600) * 1000,
+    showClock: bool("SHOW_CLOCK", true),
+    visibleIdle: bool("VISIBLE_IDLE", true),
+    showHookOverhead: bool("SHOW_HOOK_OVERHEAD", false),
+    eventLog: bool("EVENT_LOG", true),
+    debugLog: bool("DEBUG_LOG", false),
+  };
 }
 
-function bool(key, fallback) {
-  const raw = process.env[`CLAUDE_PLUGIN_OPTION_${key}`];
-  if (raw === undefined || raw === "") return fallback;
-  return !["false", "0", "no", "off"].includes(raw.trim().toLowerCase());
+/**
+ * Handles one hook event and reports what the hook should print.
+ *
+ * @param {object | null} event - the parsed hook payload.
+ * @param {{ env?: Record<string, string | undefined>, uptimeMs?: () => number }} [options] - `env` supplies
+ *   CLAUDE_PLUGIN_DATA and the CLAUDE_PLUGIN_OPTION_* settings; `uptimeMs` is how long the caller has spent on this
+ *   event, which the optional hook-overhead report uses (process uptime for the script, request age for the daemon).
+ * @returns {{ stdout: string, exitCode: number }} the text for stdout (empty when there is nothing to say) and the
+ *   exit code, which is always 0: a failure here must never block the session.
+ */
+export function handleEvent(event, { env = process.env, uptimeMs: elapsed = () => process.uptime() * 1000 } = {}) {
+  if (event === null || event === undefined) return { stdout: "", exitCode: 0 }; // `null` payload: nothing to time
+
+  dataDir = env.CLAUDE_PLUGIN_DATA || join(tmpdir(), "claude-code-timings");
+  sessionsDir = join(dataDir, "sessions");
+  config = readConfig(env);
+  uptimeMs = elapsed;
+  output = "";
+
+  try {
+    dispatch(event);
+  } catch (err) {
+    logError(event.hook_event_name, err);
+  }
+  return { stdout: output, exitCode: 0 };
 }
 
-main();
+function dispatch(event) {
+  const sessionId = safeId(event.session_id) || "unknown";
+  const dir = join(sessionsDir, sessionId);
+  const now = Date.now();
 
-function main() {
+  // Every event is logged before it is dispatched, including events this
+  // plugin has no handler for. Which events a given build actually fires is
+  // not something the docs settle -- the log is how you find out, and it is
+  // what `events` in the MCP-less debug story reads back.
+  logEvent(dir, event, now);
+
+  switch (event.hook_event_name) {
+    case "SessionStart": return onSessionStart(dir, event, now);
+    case "SessionEnd": return onSessionEnd(dir, now);
+    case "UserPromptSubmit": return onUserPromptSubmit(dir, now);
+    case "Stop": return onStop(dir, now);
+    case "PreCompact": return onPreCompact(dir, now);
+    case "PermissionRequest":
+    case "Notification": return onPermissionEvent(dir, event, now);
+    case "PreToolUse": return onPreToolUse(dir, event, now);
+    case "PostToolUse":
+    case "PostToolUseFailure": return onPostToolUse(dir, event, now);
+    case "PermissionDenied": return dropStamp(dir, event);
+    default: return;
+  }
+}
+
+// Standalone entry: one process per event, JSON on stdin, output on stdout.
+function runStandalone() {
   let event;
   try {
     event = JSON.parse(readFileSync(0, "utf8") || "{}");
   } catch {
     return; // no stdin, or not JSON: nothing to time
   }
+  const { stdout, exitCode } = handleEvent(event);
+  if (stdout) process.stdout.write(stdout);
+  process.exitCode = exitCode;
+  startDaemonIfAbsent();
+}
 
+// Reaching the standalone entry means the hook client could not use a daemon (none running, or it is out of date), so
+// start one in the background for the events that follow. Never delays or fails the hook: a lock file stops a burst of
+// concurrent fallbacks from spawning a burst of daemons, and every error is swallowed.
+function startDaemonIfAbsent() {
+  const disabled = process.env.CLAUDE_HOOKD_DISABLE;
+  if ((disabled && disabled !== "0") || process.env.CLAUDE_HOOKD_NO_SPAWN) return;
   try {
-    const sessionId = safeId(event.session_id) || "unknown";
-    const dir = join(sessionsDir, sessionId);
-    const now = Date.now();
+    const scriptsDir = dirname(fileURLToPath(import.meta.url));
+    const list = JSON.parse(readFileSync(join(scriptsDir, "hookd.json"), "utf8"));
+    const stateDir = process.env.CLAUDE_HOOKD_STATE_DIR || join(tmpdir(), "claude-code-hookd", list.pluginId);
+    const wallMs = () => performance.timeOrigin + performance.now();
 
-    // Every event is logged before it is dispatched, including events this
-    // plugin has no handler for. Which events a given build actually fires is
-    // not something the docs settle -- the log is how you find out, and it is
-    // what `events` in the MCP-less debug story reads back.
-    logEvent(dir, event, now);
-
-    switch (event.hook_event_name) {
-      case "SessionStart": return onSessionStart(dir, event, now);
-      case "SessionEnd": return onSessionEnd(dir, now);
-      case "UserPromptSubmit": return onUserPromptSubmit(dir, now);
-      case "Stop": return onStop(dir, now);
-      case "PreCompact": return onPreCompact(dir, now);
-      case "PermissionRequest":
-      case "Notification": return onPermissionEvent(dir, event, now);
-      case "PreToolUse": return onPreToolUse(dir, event, now);
-      case "PostToolUse":
-      case "PostToolUseFailure": return onPostToolUse(dir, event, now);
-      case "PermissionDenied": return dropStamp(dir, event);
-      default: return;
+    try {
+      const aliveLine = readFileSync(join(stateDir, "state"), "utf8")
+        .split("\n")
+        .find((line) => line.startsWith("aliveAt="));
+      const aliveAt = Number(aliveLine?.slice("aliveAt=".length));
+      if (wallMs() / 1000 - aliveAt < DAEMON_HEARTBEAT_STALE_SECONDS) return; // one is already serving
+    } catch {
+      // No state file: nothing is serving.
     }
-  } catch (err) {
-    logError(event.hook_event_name, err);
+
+    mkdirSync(stateDir, { recursive: true });
+    const lock = join(stateDir, "spawn.lock");
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        writeFileSync(lock, String(process.pid), { flag: "wx" });
+        break;
+      } catch {
+        // Someone else is mid-spawn unless their lock is old enough to be a leftover.
+        if (attempt > 0 || wallMs() - statSync(lock).mtimeMs < DAEMON_SPAWN_LOCK_MS) return;
+        rmSync(lock, { force: true });
+      }
+    }
+
+    spawn(process.execPath, [join(scriptsDir, "hookd.mjs")], { detached: true, stdio: "ignore", windowsHide: true }).unref();
+  } catch {
+    // The daemon is an optimisation; the hook has already done its work.
   }
 }
+
+// True when this file is the script being run, not a module being imported.
+function isEntryPoint() {
+  try {
+    return Boolean(process.argv[1]) && realpathSync(resolve(process.argv[1])) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+}
+
+if (isEntryPoint()) runStandalone();
 
 /* ------------------------------------------------------------------ events */
 
@@ -445,12 +541,12 @@ function describeTurn(turn) {
   return detail.length ? `${fmt(turn.durationMs)} (${detail.join("; ")})` : fmt(turn.durationMs);
 }
 
-// Wall time this process has been alive, which is what the turn actually paid:
-// node's startup dominates the hook's own work. Logged before exit, so it
-// misses only the final flush.
+// Wall time spent on this event so far, which is what the turn actually paid:
+// as a script, node's startup dominates the hook's own work. Logged before the
+// reply, so it misses only the final flush.
 function recordHookCost(dir) {
   if (!config.showHookOverhead) return;
-  appendTurnLog(dir, { t: "hook", ms: Math.round(process.uptime() * 1000) });
+  appendTurnLog(dir, { t: "hook", ms: Math.round(uptimeMs()) });
 }
 
 /* ------------------------------------------------------------------- state */
@@ -608,8 +704,8 @@ function logEvent(dir, event, now) {
   }
 }
 
-function emit(output) {
-  process.stdout.write(JSON.stringify(output));
+function emit(payload) {
+  output += JSON.stringify(payload);
 }
 
 function logError(event, err) {

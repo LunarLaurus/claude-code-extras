@@ -1,0 +1,7 @@
+{
+  "pluginId": "timings",
+  "defaultPort": 47821,
+  "handlers": {
+    "timings": "hook.mjs"
+  }
+}

@@ -30,7 +30,8 @@ function run(event, { env = {}, sleepMs = 0 } = {}) {
   const result = spawnSync(process.execPath, [hook], {
     input: JSON.stringify(event),
     encoding: "utf8",
-    env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, ...env },
+    // The daemon is covered by the node:test suites; this script checks the standalone entry, so keep it from spawning one.
+    env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_HOOKD_DISABLE: "1", ...env },
   });
   check(`exit 0 for ${event.hook_event_name}`, result.status === 0, `status=${result.status} stderr=${result.stderr}`);
   let json = null;
@@ -170,10 +171,10 @@ check("a turn with no tools reports no tool breakdown", !ctx(third).includes("to
 
 // --- robustness: nothing here may produce a non-zero exit or stray output ---
 console.log("\n  robustness");
-const noStdin = spawnSync(process.execPath, [hook], { input: "", encoding: "utf8", env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir } });
+const noStdin = spawnSync(process.execPath, [hook], { input: "", encoding: "utf8", env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_HOOKD_DISABLE: "1" } });
 check("empty stdin exits 0 silently", noStdin.status === 0 && noStdin.stdout === "", `${noStdin.status} ${noStdin.stdout}`);
 
-const garbage = spawnSync(process.execPath, [hook], { input: "not json", encoding: "utf8", env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir } });
+const garbage = spawnSync(process.execPath, [hook], { input: "not json", encoding: "utf8", env: { ...process.env, CLAUDE_PLUGIN_DATA: dataDir, CLAUDE_HOOKD_DISABLE: "1" } });
 check("malformed stdin exits 0 silently", garbage.status === 0 && garbage.stdout === "", `${garbage.status} ${garbage.stdout}`);
 
 run({ ...S, hook_event_name: "PostToolUse", tool_name: "Bash", tool_use_id: "toolu_never_started" });
@@ -226,13 +227,17 @@ const resumed2 = run(
 );
 check("a resumed session can still measure its gap", /source=resume idle for \d+s, last active \d{2}:\d{2}:\d{2}/.test(ctx(resumed2)), ctx(resumed2));
 
-// The manifest must launch the script through node: a bare path relies on the shebang and exec bit, which a native
-// Windows shell does not honour.
+// Every hook command goes through the daemon client, which is sourced by the shell, and must keep `node hook.mjs`
+// as its own fallback: if the client script is missing or unparseable the command still ends in node, and the
+// client itself falls back to the same script whenever the daemon cannot serve an event. A bare script path would
+// rely on the shebang and exec bit, which a native Windows shell does not honour, so node is always explicit.
 {
   const manifest = JSON.parse(readFileSync(join(dirname(hook), "..", "hooks", "hooks.json"), "utf8"));
   const commands = Object.values(manifest.hooks).flatMap((groups) => groups.flatMap((g) => g.hooks.map((h) => h.command)));
+  const shape =
+    /^\. "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/hook-client\.sh" timings "\$\{CLAUDE_PLUGIN_ROOT\}" \|\| exec node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/hook\.mjs"$/;
   check("hooks.json registers at least one hook", commands.length > 0);
-  check("every hook command launches through node", commands.every((c) => /^node "\$\{CLAUDE_PLUGIN_ROOT\}\/scripts\/hook\.mjs"$/.test(c)), commands.find((c) => !c.startsWith("node ")));
+  check("every hook command sources the daemon client and falls back to node", commands.every((c) => shape.test(c)), commands.find((c) => !shape.test(c)));
 }
 
 rmSync(dataDir, { recursive: true, force: true });
